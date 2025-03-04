@@ -316,6 +316,74 @@ def get_last_checkpoint(conn, filename):
         sys.stderr.write(f"Error retrieving checkpoint for {filename}: {str(e)}\n")
         return None, 0, 0
 
+# Global config for cached uncompressed files
+use_cached_uncompressed_files = config.get('processing.use_cached_uncompressed', True)
+cached_uncompressed_dir = config.get('processing.cached_uncompressed_dir', os.path.join(working_directory, 'uncompressed_cache'))
+
+# Ensure cache directory exists if using cached uncompressed files
+if use_cached_uncompressed_files and not os.path.exists(cached_uncompressed_dir):
+    os.makedirs(cached_uncompressed_dir)
+
+# Function to decompress a file once and cache the result for future use
+def decompress_and_cache(file_path, tld):
+    """Decompress a .gz file once and cache the result for faster future processing"""
+    if not use_cached_uncompressed_files:
+        return None
+        
+    # Define the cache file path based on the original filename and a hash of its contents
+    filename = os.path.basename(file_path)
+    base_filename = os.path.splitext(filename)[0]  # Remove .gz extension
+    cached_file_path = os.path.join(cached_uncompressed_dir, f"{base_filename}")
+    
+    # Check if the cached file exists and is not stale
+    if os.path.exists(cached_file_path):
+        # Check if gzip file is newer than cached file (indicating a fresh download)
+        if os.path.getmtime(file_path) > os.path.getmtime(cached_file_path):
+            print(f"{datetime.now()}: Compressed file {file_path} is newer than cached version, redecompressing...")
+        else:
+            print(f"{datetime.now()}: Using cached uncompressed file for {tld}")
+            return cached_file_path
+    
+    # We need to decompress the file
+    print(f"{datetime.now()}: Decompressing {tld} file to cache for faster processing...")
+    start_time = datetime.now()
+    
+    try:
+        # Streaming decompression to avoid loading the entire file into memory
+        with open(file_path, 'rb') as f_in:
+            with open(cached_file_path, 'wb') as f_out:
+                decompressor = gzip.GzipFile(fileobj=f_in, mode='rb')
+                
+                # Use larger chunks for better throughput
+                chunk_size = 10 * 1024 * 1024  # 10MB chunks
+                while True:
+                    chunk = decompressor.read(chunk_size)
+                    if not chunk:
+                        break
+                    f_out.write(chunk)
+                    
+                    # Log progress periodically
+                    current_time = datetime.now()
+                    if (current_time - start_time).total_seconds() % 5 < 0.1:  # Log every ~5 seconds
+                        compressed_size = os.path.getsize(file_path)
+                        compressed_pos = f_in.tell()
+                        progress = f"{compressed_pos/compressed_size*100:.1f}% of compressed file" if compressed_size > 0 else ""
+                        print(f"{current_time}: Decompressing {tld} file... {progress}")
+        
+        end_time = datetime.now()
+        print(f"{datetime.now()}: Finished decompressing {tld} file. Time spent: {end_time - start_time}")
+        return cached_file_path
+    
+    except Exception as e:
+        sys.stderr.write(f"Error decompressing {file_path}: {str(e)}\n")
+        # If decompression fails, remove any partial cache file
+        if os.path.exists(cached_file_path):
+            try:
+                os.remove(cached_file_path)
+            except:
+                pass
+        return None
+
 # Generator function to process zonefile line by line with resumability
 def process_zonefile(file_path, tld, zonefile_id=None, resume_from_line=0, start_record_count=0):
     """Process a zonefile line by line without loading everything into memory with resumability"""
@@ -328,119 +396,92 @@ def process_zonefile(file_path, tld, zonefile_id=None, resume_from_line=0, start
     checkpoint_interval = timedelta(seconds=60)  # Save checkpoint every minute
     
     try:
-        # Use a custom, streaming-friendly approach to handle gigabyte-sized gzip files
-        # Open the gzip file as a binary stream
-        with open(file_path, 'rb') as f_in:
-            try:
-                # Create a streaming decompressor
-                decompressor = gzip.GzipFile(fileobj=f_in, mode='rb')
-                
-                # Create a line iterator that reads efficiently and handles resuming
+        # Check if we should use a cached uncompressed file for faster processing
+        uncompressed_file_path = None
+        is_compressed = file_path.endswith('.gz')
+        
+        if is_compressed and use_cached_uncompressed_files:
+            uncompressed_file_path = decompress_and_cache(file_path, tld)
+        
+        # If we have an uncompressed cached file, use it instead of doing streaming decompression
+        if uncompressed_file_path:
+            print(f"{datetime.now()}: Processing {tld} using uncompressed cached file")
+            file_to_process = uncompressed_file_path
+            open_mode = 'r'  # Text mode for uncompressed file
+        else:
+            print(f"{datetime.now()}: Processing {tld} using direct decompression")
+            file_to_process = file_path
+            open_mode = 'rb'  # Binary mode for compressed file
+        
+        # Process the file line by line
+        if uncompressed_file_path:
+            # Process uncompressed file directly (much faster)
+            with open(file_to_process, open_mode, buffering=8192) as f_in:
                 records_batch = []
-                buffer = b""
-                chunk_size = 1024 * 1024  # 1MB chunks for efficient reading
                 
                 # Skip to the resume point if needed
                 if resume_from_line > 0:
                     print(f"{datetime.now()}: Resuming {tld} from line {resume_from_line} with {start_record_count} records already processed")
+                    for _ in range(resume_from_line):
+                        next(f_in, None)
                     line_number = resume_from_line
-                    skipped_lines = 0
-                    
-                    # Skip lines more efficiently using a buffer approach
-                    while skipped_lines < resume_from_line:
-                        chunk = decompressor.read(chunk_size)
-                        if not chunk:
-                            break
-                        
-                        buffer += chunk
-                        lines = buffer.split(b'\n')
-                        # Keep the last incomplete line in the buffer
-                        buffer = lines[-1]
-                        # Process complete lines
-                        complete_lines = lines[:-1]
-                        skipped_lines += len(complete_lines)
-                        
-                        # If we skipped too many, rewind by putting excess lines back in buffer
-                        if skipped_lines > resume_from_line:
-                            excess = skipped_lines - resume_from_line
-                            buffer = b'\n'.join(complete_lines[-excess:]) + b'\n' + buffer
-                            skipped_lines = resume_from_line
                 
-                # Process the file line by line without loading everything into memory
-                while True:
-                    # Read a chunk of compressed data
-                    chunk = decompressor.read(chunk_size)
-                    if not chunk and not buffer:
-                        break
-                    
-                    buffer += chunk
-                    lines = buffer.split(b'\n')
-                    
-                    # Keep the last potentially incomplete line in the buffer
-                    buffer = lines[-1] if chunk else b""
-                    
-                    # Process complete lines
-                    complete_lines = lines[:-1] if chunk else lines
-                    
-                    for line_bytes in complete_lines:
-                        try:
-                            line = line_bytes.decode('utf-8', errors='ignore').strip()
-                            line_number += 1
-                            
-                            # Skip empty lines and comments
-                            if not line or line.startswith(';'):
-                                continue
-                            
-                            # Basic parsing of zone file records
-                            parts = line.split()
-                            if len(parts) >= 4:  # DNS records have at least 4 parts: name, ttl, class, type
-                                try:
-                                    domain_name = parts[0]
-                                    ttl = parts[1]
-                                    record_class = parts[2].lower()  # typically 'in'
-                                    record_type = parts[3].upper()  # A, AAAA, MX, etc.
-                                    record_data = ' '.join(parts[4:]) if len(parts) > 4 else ''
-                                    
-                                    record_count += 1
-                                    
-                                    # Add to current batch
-                                    records_batch.append({
-                                        'domain_name': domain_name,
-                                        'record_type': record_type,
-                                        'ttl': ttl,
-                                        'record_data': record_data
-                                    })
-                                    
-                                    # When batch is full, yield it
-                                    if len(records_batch) >= batch_size:
-                                        yield records_batch, record_count, line_number, 'processing'
-                                        records_batch = []
-                                    
-                                    # Log progress periodically
-                                    current_time = datetime.now()
-                                    if current_time - last_log_time > log_interval:
-                                        # Get file size info
-                                        try:
-                                            gzip_size = os.path.getsize(file_path)
-                                            compressed_pos = f_in.tell()
-                                            progress = f"{compressed_pos/gzip_size*100:.1f}% of compressed file" if gzip_size > 0 else ""
-                                        except:
-                                            progress = ""
-                                            
-                                        print(f"{current_time}: Processed {record_count:,} records so far from {tld} (line {line_number:,}) {progress}")
-                                        last_log_time = current_time
-                                    
-                                except Exception as e:
-                                    # Skip malformed records but don't crash
-                                    sys.stderr.write(f"Error parsing record at line {line_number}: {line} - {str(e)}\n")
-                                    continue
-                        except Exception as e:
-                            sys.stderr.write(f"Error processing line {line_number} in {tld}: {str(e)}\n")
+                # Process the file line by line
+                for line in f_in:
+                    try:
+                        line = line.strip()
+                        line_number += 1
+                        
+                        # Skip empty lines and comments
+                        if not line or line.startswith(';'):
                             continue
-                    
-                    # If we've reached the end of the file, exit the loop
-                    if not chunk:
-                        break
+                        
+                        # Basic parsing of zone file records
+                        parts = line.split()
+                        if len(parts) >= 4:  # DNS records have at least 4 parts: name, ttl, class, type
+                            try:
+                                domain_name = parts[0]
+                                ttl = parts[1]
+                                record_class = parts[2].lower()  # typically 'in'
+                                record_type = parts[3].upper()  # A, AAAA, MX, etc.
+                                record_data = ' '.join(parts[4:]) if len(parts) > 4 else ''
+                                
+                                record_count += 1
+                                
+                                # Add to current batch
+                                records_batch.append({
+                                    'domain_name': domain_name,
+                                    'record_type': record_type,
+                                    'ttl': ttl,
+                                    'record_data': record_data
+                                })
+                                
+                                # When batch is full, yield it
+                                if len(records_batch) >= batch_size:
+                                    yield records_batch, record_count, line_number, 'processing'
+                                    records_batch = []
+                                
+                                # Log progress periodically
+                                current_time = datetime.now()
+                                if current_time - last_log_time > log_interval:
+                                    # Calculate progress based on file position
+                                    try:
+                                        total_size = os.path.getsize(file_to_process)
+                                        current_pos = f_in.tell()
+                                        progress = f"{current_pos/total_size*100:.1f}% of uncompressed file" if total_size > 0 else ""
+                                    except:
+                                        progress = ""
+                                    
+                                    print(f"{current_time}: Processed {record_count:,} records so far from {tld} (line {line_number:,}) {progress}")
+                                    last_log_time = current_time
+                                
+                            except Exception as e:
+                                # Skip malformed records but don't crash
+                                sys.stderr.write(f"Error parsing record at line {line_number}: {line} - {str(e)}\n")
+                                continue
+                    except Exception as e:
+                        sys.stderr.write(f"Error processing line {line_number} in {tld}: {str(e)}\n")
+                        continue
                 
                 # Don't forget the last batch if it's not empty
                 if records_batch:
@@ -448,24 +489,149 @@ def process_zonefile(file_path, tld, zonefile_id=None, resume_from_line=0, start
                 else:
                     # If we've already sent all the batches but need to mark as complete
                     yield [], record_count, line_number, 'complete'
-            
-            except (gzip.BadGzipFile, EOFError, zlib.error) as e:
-                # Handle corrupt gzip file specifically
-                error_message = f"Error {str(e)} while decompressing data"
-                sys.stderr.write(f"Error processing zonefile {tld} at line {line_number}: {error_message}\n")
-                # Yield current batch with error status
-                if 'records_batch' in locals() and records_batch:
-                    yield records_batch, record_count, line_number, 'error'
-                # Also update database status to mark file as corrupted
-                if db_enabled:
-                    cursor = sqlite3.connect(db_path).cursor()
-                    cursor.execute(
-                        'UPDATE download_status SET status = ?, error_message = ? WHERE filename = ?',
-                        ('error', error_message, os.path.basename(file_path))
-                    )
-                    cursor.connection.commit()
-                    cursor.connection.close()
-                raise
+                
+        else:
+            # Fallback to the original streaming decompression approach
+            with open(file_to_process, open_mode) as f_in:
+                try:
+                    # Create a streaming decompressor if needed
+                    if is_compressed:
+                        decompressor = gzip.GzipFile(fileobj=f_in, mode='rb')
+                        file_reader = decompressor
+                    else:
+                        file_reader = f_in
+                    
+                    # Create a line iterator that reads efficiently and handles resuming
+                    records_batch = []
+                    buffer = b""
+                    chunk_size = 1024 * 1024  # 1MB chunks for efficient reading
+                    
+                    # Skip to the resume point if needed
+                    if resume_from_line > 0:
+                        print(f"{datetime.now()}: Resuming {tld} from line {resume_from_line} with {start_record_count} records already processed")
+                        line_number = resume_from_line
+                        skipped_lines = 0
+                        
+                        # Skip lines more efficiently using a buffer approach
+                        while skipped_lines < resume_from_line:
+                            chunk = file_reader.read(chunk_size)
+                            if not chunk:
+                                break
+                            
+                            buffer += chunk
+                            lines = buffer.split(b'\n')
+                            # Keep the last incomplete line in the buffer
+                            buffer = lines[-1]
+                            # Process complete lines
+                            complete_lines = lines[:-1]
+                            skipped_lines += len(complete_lines)
+                            
+                            # If we skipped too many, rewind by putting excess lines back in buffer
+                            if skipped_lines > resume_from_line:
+                                excess = skipped_lines - resume_from_line
+                                buffer = b'\n'.join(complete_lines[-excess:]) + b'\n' + buffer
+                                skipped_lines = resume_from_line
+                    
+                    # Process the file line by line without loading everything into memory
+                    while True:
+                        # Read a chunk of compressed data
+                        chunk = file_reader.read(chunk_size)
+                        if not chunk and not buffer:
+                            break
+                        
+                        buffer += chunk
+                        lines = buffer.split(b'\n')
+                        
+                        # Keep the last potentially incomplete line in the buffer
+                        buffer = lines[-1] if chunk else b""
+                        
+                        # Process complete lines
+                        complete_lines = lines[:-1] if chunk else lines
+                        
+                        for line_bytes in complete_lines:
+                            try:
+                                line = line_bytes.decode('utf-8', errors='ignore').strip()
+                                line_number += 1
+                                
+                                # Skip empty lines and comments
+                                if not line or line.startswith(';'):
+                                    continue
+                                
+                                # Basic parsing of zone file records
+                                parts = line.split()
+                                if len(parts) >= 4:  # DNS records have at least 4 parts: name, ttl, class, type
+                                    try:
+                                        domain_name = parts[0]
+                                        ttl = parts[1]
+                                        record_class = parts[2].lower()  # typically 'in'
+                                        record_type = parts[3].upper()  # A, AAAA, MX, etc.
+                                        record_data = ' '.join(parts[4:]) if len(parts) > 4 else ''
+                                        
+                                        record_count += 1
+                                        
+                                        # Add to current batch
+                                        records_batch.append({
+                                            'domain_name': domain_name,
+                                            'record_type': record_type,
+                                            'ttl': ttl,
+                                            'record_data': record_data
+                                        })
+                                        
+                                        # When batch is full, yield it
+                                        if len(records_batch) >= batch_size:
+                                            yield records_batch, record_count, line_number, 'processing'
+                                            records_batch = []
+                                        
+                                        # Log progress periodically
+                                        current_time = datetime.now()
+                                        if current_time - last_log_time > log_interval:
+                                            # Get file size info
+                                            try:
+                                                gzip_size = os.path.getsize(file_path)
+                                                compressed_pos = f_in.tell()
+                                                progress = f"{compressed_pos/gzip_size*100:.1f}% of compressed file" if gzip_size > 0 else ""
+                                            except:
+                                                progress = ""
+                                                
+                                            print(f"{current_time}: Processed {record_count:,} records so far from {tld} (line {line_number:,}) {progress}")
+                                            last_log_time = current_time
+                                        
+                                    except Exception as e:
+                                        # Skip malformed records but don't crash
+                                        sys.stderr.write(f"Error parsing record at line {line_number}: {line} - {str(e)}\n")
+                                        continue
+                            except Exception as e:
+                                sys.stderr.write(f"Error processing line {line_number} in {tld}: {str(e)}\n")
+                                continue
+                        
+                        # If we've reached the end of the file, exit the loop
+                        if not chunk:
+                            break
+                    
+                    # Don't forget the last batch if it's not empty
+                    if records_batch:
+                        yield records_batch, record_count, line_number, 'complete'
+                    else:
+                        # If we've already sent all the batches but need to mark as complete
+                        yield [], record_count, line_number, 'complete'
+                
+                except (gzip.BadGzipFile, EOFError, zlib.error) as e:
+                    # Handle corrupt gzip file specifically
+                    error_message = f"Error {str(e)} while decompressing data"
+                    sys.stderr.write(f"Error processing zonefile {tld} at line {line_number}: {error_message}\n")
+                    # Yield current batch with error status
+                    if 'records_batch' in locals() and records_batch:
+                        yield records_batch, record_count, line_number, 'error'
+                    # Also update database status to mark file as corrupted
+                    if db_enabled:
+                        cursor = sqlite3.connect(db_path).cursor()
+                        cursor.execute(
+                            'UPDATE download_status SET status = ?, error_message = ? WHERE filename = ?',
+                            ('error', error_message, os.path.basename(file_path))
+                        )
+                        cursor.connection.commit()
+                        cursor.connection.close()
+                    raise
                 
     except Exception as e:
         sys.stderr.write(f"Error processing zonefile {tld} at line {line_number}: {str(e)}\n")
@@ -494,10 +660,8 @@ def save_to_database(conn, filename, tld, process_generator):
             zonefile_id = existing_zonefile_id
             print(f"{start_time}: Resuming processing of {filename} from line {resume_line} with {resume_record_count} records already processed")
             
-            # Check if we need to use the checkpoint directory or regular zonefiles directory
-            zonefile_path = os.path.join(checkpoint_dir, 'zonefiles', filename) 
-            if not os.path.exists(zonefile_path):
-                zonefile_path = os.path.join(working_directory, 'zonefiles', filename)
+            # Get the zonefile path from working directory
+            zonefile_path = os.path.join(working_directory, 'zonefiles', filename)
             
             # Create a generator that starts from the checkpoint
             process_generator = process_zonefile(
@@ -674,7 +838,73 @@ def download_one_zone(url, output_directory, db_conn=None):
     download_status, existing_filename = check_download_status(db_conn, url)
     
     if download_status == 'complete' and existing_filename and resume_downloads:
-        print(f"{datetime.now()}: File {existing_filename} already downloaded, skipping")
+        print(f"{datetime.now()}: File {existing_filename} already downloaded")
+        
+        # Check if the file was fully processed or if processing was interrupted
+        if db_enabled:
+            cursor = db_conn.cursor()
+            try:
+                # Look for an incomplete processing record
+                cursor.execute('''
+                SELECT 1 FROM processing_checkpoints 
+                WHERE filename = ? AND status != 'complete'
+                ORDER BY last_updated DESC LIMIT 1
+                ''', (existing_filename,))
+                
+                incomplete_processing = cursor.fetchone()
+                
+                if incomplete_processing:
+                    print(f"{datetime.now()}: Found incomplete processing for {existing_filename}, will resume processing")
+                else:
+                    # Also check if there's no processing record at all for this file
+                    cursor.execute('''
+                    SELECT 1 FROM processing_checkpoints 
+                    WHERE filename = ?
+                    ''', (existing_filename,))
+                    
+                    has_any_processing = cursor.fetchone()
+                    
+                    if not has_any_processing and db_enabled:
+                        print(f"{datetime.now()}: No processing record found for {existing_filename}, will process")
+                    else:
+                        print(f"{datetime.now()}: Processing was completed for {existing_filename}, skipping")
+                        return existing_filename
+            except Exception as e:
+                sys.stderr.write(f"Error checking processing status for {existing_filename}: {str(e)}\n")
+        
+        # If we reached here, we need to process the file (resume or start new processing)
+        path = '{0}/{1}'.format(output_directory, existing_filename)
+        
+        # Extract the TLD from the filename
+        tld = existing_filename.split('.')[0]
+        
+        if db_enabled:
+            try:
+                process_start_time = datetime.now()
+                print(f"{process_start_time}: Starting/resuming processing of {existing_filename}")
+                
+                # Check for previously interrupted processing
+                existing_zonefile_id, resume_line, resume_record_count = get_last_checkpoint(db_conn, existing_filename)
+                
+                if existing_zonefile_id and resume_processing:
+                    generator = process_zonefile(
+                        path, tld, 
+                        zonefile_id=existing_zonefile_id,
+                        resume_from_line=resume_line,
+                        start_record_count=resume_record_count
+                    )
+                else:
+                    generator = process_zonefile(path, tld)
+                
+                # Save to database using the generator
+                total_records = save_to_database(db_conn, existing_filename, tld, generator)
+                
+                process_end_time = datetime.now()
+                print(f"{process_end_time}: Completed processing {total_records} records from {existing_filename}. Time spent: {process_end_time - process_start_time}")
+                
+            except Exception as e:
+                sys.stderr.write(f"Error processing zonefile {existing_filename}: {str(e)}\n")
+                
         return existing_filename
     
     global access_token

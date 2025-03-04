@@ -12,6 +12,8 @@
   "resume.enabled": true,
   "resume.processing": true,
   "resume.checkpoint_dir": "/path/to/checkpoints",
+  "processing.use_cached_uncompressed": true,
+  "processing.cached_uncompressed_dir": "/path/to/uncompressed_cache",
   "service.enabled": false,
   "service.download_start_time": "00:15:00",
   "service.download_end_time": "05:45:00",

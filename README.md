@@ -54,7 +54,11 @@ This client now supports extracting zone file data, tracking changes, and sendin
    - `resume.processing`: Enable resumable processing (default: true)
    - `resume.checkpoint_dir`: Directory for checkpoint files (default: working_directory/checkpoints)
 
-3. To enable automated service that tracks changes and sends webhooks:
+3. For large zone files (like .com), enable caching of uncompressed files:
+   - `processing.use_cached_uncompressed`: Enable caching of uncompressed files (default: true)
+   - `processing.cached_uncompressed_dir`: Directory to store uncompressed files (default: working_directory/uncompressed_cache)
+
+4. To enable automated service that tracks changes and sends webhooks:
    - `service.enabled`: Enable the automated zonefile service (default: false)
    - `service.download_start_time`: Start of download window (default: "00:15:00" UTC)
    - `service.download_end_time`: End of download window (default: "05:45:00" UTC)
@@ -62,7 +66,7 @@ This client now supports extracting zone file data, tracking changes, and sendin
    - `service.change_tracking.enabled`: Enable change tracking (default: true)
    - Configure `webhooks` array with endpoints to receive notifications
 
-4. When you run the script or service, it will:
+5. When you run the script or service, it will:
    - Download the zone files (resuming interrupted downloads if applicable)
    - Stream and process each zonefile line-by-line without loading it entirely into memory
    - Insert records in efficient batches with optimized transactions
@@ -82,6 +86,7 @@ The database contains several tables with performance-optimized indexes:
 - `service_status`: Tracks automated service runs and statuses
 
 Performance Optimizations:
+- **Cached Uncompressed Files**: Optionally caches uncompressed versions of zone files for much faster processing
 - **True Streaming**: Files are processed in binary chunks without decompressing the entire file at once
 - **Memory Efficiency**: Advanced buffering approach to handle multi-gigabyte files with minimal memory
 - **Batch Processing**: Records are processed in configurable batches to optimize memory usage
