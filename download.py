@@ -504,7 +504,7 @@ def process_zonefile(file_path, tld, zonefile_id=None, resume_from_line=0, start
                     # Create a line iterator that reads efficiently and handles resuming
                     records_batch = []
                     buffer = b""
-                    chunk_size = 10 * 1024 * 1024  # 1MB chunks for efficient reading
+                    chunk_size = 1024 * 1024  # 1MB chunks for efficient reading
                     
                     # Skip to the resume point if needed
                     if resume_from_line > 0:
